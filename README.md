@@ -14,3 +14,8 @@
 
 👨‍🏫 Docente: 
 - Jorge Iván Padilla Buriticá
+
+
+
+### Workshop_02
+[Enlace Streamlit](https://intro-ia-supervised.onrender.com)
