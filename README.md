@@ -19,3 +19,5 @@
 
 ### Workshop_02
 [Enlace Streamlit](https://intro-ia-supervised.onrender.com)
+![Streamlit App](Workshop_02/screenshot_streamlit.png)
+
