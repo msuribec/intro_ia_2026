@@ -59,16 +59,6 @@ Además, `restart_streamlit_app()` limpia `st.cache_data`, `st.cache_resource` y
 
 ## Features del Streamlit y cómo fueron implementadas
 
-### Configuración visual base
-
-Antes de renderizar la interfaz, la app configura Streamlit con `st.set_page_config()`:
-
-- título de página `My-Expense Auditor`,
-- icono `💰`,
-- layout `centered`.
-
-Además inyecta CSS con `st.markdown(..., unsafe_allow_html=True)` para personalizar los botones primarios en verde y mantener una identidad visual consistente.
-
 ### 1. Configuración inicial y barra lateral
 
 ### API key de Gemini

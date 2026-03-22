@@ -1,0 +1,2 @@
+"""My-Expense Auditor package."""
+
