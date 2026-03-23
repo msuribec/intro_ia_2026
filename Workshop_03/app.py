@@ -324,36 +324,87 @@ def clamp_score(value: Any, lower: int = 1, upper: int = 10) -> int:
     return max(lower, min(upper, value))
 
 
-def calibrate_agent_judge_score(judge_data: dict, assistant_answer: str) -> dict:
+def calibrate_agent_judge_score(
+    judge_data: dict,
+    user_question: str,
+    assistant_answer: str,
+) -> dict:
     """Hace el judge del agente menos complaciente y deriva el score desde sub-scores."""
     veracidad = clamp_score(judge_data.get("veracidad", 1))
     coherencia = clamp_score(judge_data.get("coherencia", 1))
     relevancia = clamp_score(judge_data.get("relevancia", 1))
     derived_score = round((veracidad + coherencia + relevancia) / 3)
 
+    question_lower = user_question.lower()
     answer_tokens = len(tokenize_text(assistant_answer))
     lowered_answer = assistant_answer.lower()
+    max_allowed_score = 10
 
-    # Las respuestas muy cortas o evasivas no deberían recibir un 9/10 o 10/10.
-    if answer_tokens < 80 and derived_score > 8:
-        derived_score = 8
-    if answer_tokens < 40 and derived_score > 7:
-        derived_score = 7
+    requests_structure = bool(
+        re.search(
+            r"\b(c[oó]mo|como|pasos?|step|steps|compara|comparar|diferencia|"
+            r"ventajas?|desventajas?|por qu[eé]|why|cu[aá]ndo|when|lista|resume)\b",
+            question_lower,
+        )
+    )
+    has_structure = bool(
+        re.search(
+            r"(\n\s*[-*]\s)|(\n\s*\d+\.)|\b(primero|segundo|tercero|paso|pasos|"
+            r"ventaja|desventaja|ejemplo|por ejemplo|in summary|resumen)\b",
+            lowered_answer,
+        )
+    )
+    has_specificity = bool(
+        re.search(
+            r"\b(transformer|embedding|gradiente|regresi[oó]n|clasificaci[oó]n|"
+            r"attention|token|matriz|modelo|dataset|hiperpar[aá]metro|"
+            r"precisi[oó]n|recall|f1|python|numpy|pandas|overfitting)\b",
+            lowered_answer,
+        )
+    )
+
+    # Las respuestas muy cortas no deberían recibir notas máximas.
+    if answer_tokens < 140:
+        max_allowed_score = min(max_allowed_score, 9)
+    if answer_tokens < 90:
+        max_allowed_score = min(max_allowed_score, 8)
+    if answer_tokens < 50:
+        max_allowed_score = min(max_allowed_score, 7)
+    if answer_tokens < 25:
+        max_allowed_score = min(max_allowed_score, 6)
+
+    # Si la pregunta sugiere pasos/comparación/lista y no hay estructura, bajamos el techo.
+    if requests_structure and not has_structure:
+        max_allowed_score = min(max_allowed_score, 7)
+
+    # Respuestas genéricas sin detalles concretos no deberían pasar de 8.
+    if not has_specificity:
+        max_allowed_score = min(max_allowed_score, 8)
+
+    # Evasivas o fuera de dominio deben quedar aún más abajo.
     if any(
         phrase in lowered_answer
         for phrase in [
             "no estoy seguro",
             "no tengo suficiente contexto",
             "está fuera de mi dominio",
+            "esta fuera de mi dominio",
             "no puedo confirmar",
+            "no puedo ayudarte con eso",
+            "no cuento con suficiente información",
         ]
-    ) and derived_score > 6:
-        derived_score = 6
+    ):
+        max_allowed_score = min(max_allowed_score, 6)
+
+    # Solo dejamos llegar a 10 si la respuesta realmente se ve excelente.
+    if derived_score >= 10:
+        if answer_tokens < 180 or not has_structure or not has_specificity:
+            max_allowed_score = min(max_allowed_score, 9)
 
     judge_data["veracidad"] = veracidad
     judge_data["coherencia"] = coherencia
     judge_data["relevancia"] = relevancia
-    judge_data["score"] = clamp_score(derived_score)
+    judge_data["score"] = clamp_score(min(derived_score, max_allowed_score))
     return judge_data
 
 
@@ -431,14 +482,17 @@ def run_part4_judge(
         "Usa esta escala: 10 = excelente, completa, precisa y adaptada a la pregunta; "
         "8-9 = fuerte pero con pequeñas omisiones; 6-7 = útil pero incompleta o genérica; "
         "4-5 = problemas importantes; 1-3 = incorrecta, irrelevante o muy deficiente. "
-        "No uses 10 por defecto. Devuelve JSON válido."
+        "Empieza tu evaluación mental desde 6, no desde 10. "
+        "Solo sube a 9 o 10 si la respuesta es claramente sobresaliente. "
+        "Devuelve JSON válido."
     )
     judge_prompt = (
         f"PREGUNTA DEL USUARIO:\n{user_question}\n\n"
         f"RESPUESTA DEL AGENTE:\n{assistant_answer}\n\n"
         "Evalúa por separado veracidad, coherencia y relevancia. "
         "Si la respuesta es breve, genérica o le faltan pasos importantes, baja el puntaje. "
-        "Solo una respuesta excelente en las tres dimensiones merece 10."
+        "Solo una respuesta excelente en las tres dimensiones merece 10. "
+        "Una respuesta simplemente correcta no debe recibir 10."
     )
     last_error = None
     for attempt in range(2):
@@ -472,7 +526,7 @@ def run_part4_judge(
 
     for key in ("score", "veracidad", "coherencia", "relevancia"):
         judge_data[key] = clamp_score(judge_data.get(key, 1))
-    judge_data = calibrate_agent_judge_score(judge_data, assistant_answer)
+    judge_data = calibrate_agent_judge_score(judge_data, user_question, assistant_answer)
     return judge_data, response
 
 
