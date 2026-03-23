@@ -324,6 +324,39 @@ def clamp_score(value: Any, lower: int = 1, upper: int = 10) -> int:
     return max(lower, min(upper, value))
 
 
+def calibrate_agent_judge_score(judge_data: dict, assistant_answer: str) -> dict:
+    """Hace el judge del agente menos complaciente y deriva el score desde sub-scores."""
+    veracidad = clamp_score(judge_data.get("veracidad", 1))
+    coherencia = clamp_score(judge_data.get("coherencia", 1))
+    relevancia = clamp_score(judge_data.get("relevancia", 1))
+    derived_score = round((veracidad + coherencia + relevancia) / 3)
+
+    answer_tokens = len(tokenize_text(assistant_answer))
+    lowered_answer = assistant_answer.lower()
+
+    # Las respuestas muy cortas o evasivas no deberían recibir un 9/10 o 10/10.
+    if answer_tokens < 80 and derived_score > 8:
+        derived_score = 8
+    if answer_tokens < 40 and derived_score > 7:
+        derived_score = 7
+    if any(
+        phrase in lowered_answer
+        for phrase in [
+            "no estoy seguro",
+            "no tengo suficiente contexto",
+            "está fuera de mi dominio",
+            "no puedo confirmar",
+        ]
+    ) and derived_score > 6:
+        derived_score = 6
+
+    judge_data["veracidad"] = veracidad
+    judge_data["coherencia"] = coherencia
+    judge_data["relevancia"] = relevancia
+    judge_data["score"] = clamp_score(derived_score)
+    return judge_data
+
+
 def run_part3_judge(
     api_key: str,
     model_name: str,
@@ -393,13 +426,19 @@ def run_part4_judge(
     """Autoevalúa la última respuesta del agente y devuelve score + subtotales."""
     client = get_client(api_key)
     system_instruction = (
-        "Eres un evaluador de asistentes conversacionales especializados en ML. "
-        "Evalúa la última respuesta según veracidad, coherencia y relevancia y devuelve JSON válido."
+        "Eres un evaluador estricto de asistentes conversacionales especializados en ML. "
+        "Debes calificar con criterio severo y evitar inflar puntajes. "
+        "Usa esta escala: 10 = excelente, completa, precisa y adaptada a la pregunta; "
+        "8-9 = fuerte pero con pequeñas omisiones; 6-7 = útil pero incompleta o genérica; "
+        "4-5 = problemas importantes; 1-3 = incorrecta, irrelevante o muy deficiente. "
+        "No uses 10 por defecto. Devuelve JSON válido."
     )
     judge_prompt = (
         f"PREGUNTA DEL USUARIO:\n{user_question}\n\n"
         f"RESPUESTA DEL AGENTE:\n{assistant_answer}\n\n"
-        "Devuelve una puntuación general de 1 a 10 y los sub-scores."
+        "Evalúa por separado veracidad, coherencia y relevancia. "
+        "Si la respuesta es breve, genérica o le faltan pasos importantes, baja el puntaje. "
+        "Solo una respuesta excelente en las tres dimensiones merece 10."
     )
     last_error = None
     for attempt in range(2):
@@ -433,6 +472,7 @@ def run_part4_judge(
 
     for key in ("score", "veracidad", "coherencia", "relevancia"):
         judge_data[key] = clamp_score(judge_data.get(key, 1))
+    judge_data = calibrate_agent_judge_score(judge_data, assistant_answer)
     return judge_data, response
 
 
@@ -542,10 +582,18 @@ st.markdown(
         border-radius: 0.9rem;
         padding: 0.45rem 0.9rem;
         background: #f7f9fc;
+        color: #1f2937 !important;
+    }
+    div[role="radiogroup"] label * {
+        color: #1f2937 !important;
     }
     div[role="radiogroup"] label:has(input:checked) {
         border-color: #4f83ff;
         background: #e8f0ff;
+        color: #103a8c !important;
+    }
+    div[role="radiogroup"] label:has(input:checked) * {
+        color: #103a8c !important;
     }
     </style>
     """,
