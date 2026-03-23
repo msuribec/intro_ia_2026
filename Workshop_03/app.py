@@ -547,10 +547,17 @@ def history_to_gemini_contents(history: list[dict]) -> list:
 
 
 def build_radar_chart(scores: dict) -> go.Figure:
-    """Construye un radar chart con métricas normalizadas a 0-1."""
+    """Construye un radar chart normalizando métricas crudas al rango 0-1."""
     categories = list(scores.keys())
-    values = list(scores.values())
-    normalized = [min(max(value, 0), 1) for value in values]
+    normalized = []
+
+    for metric_name in categories:
+        value = scores[metric_name]
+        if metric_name == "LLM-Judge":
+            normalized.append(min(max(float(value) / 10.0, 0), 1))
+        else:
+            normalized.append(min(max(float(value), 0), 1))
+
     return go.Figure(
         go.Scatterpolar(
             r=normalized + [normalized[0]],
@@ -798,12 +805,12 @@ if active_section == SECTION_LAB:
                         supports_top_k=supports_top_k,
                     )
                     latency = round(time.time() - start_time, 2)
-                    visible_tokens = len(tokenize_text(text))
+                    usage = get_usage_stats(response)
                     results.append(
                         {
                             "label": config["label"],
                             "text": text,
-                            "n_tokens": visible_tokens,
+                            "n_tokens": usage["completion_tokens"],
                             "ttr": compute_ttr(text),
                             "latency": latency,
                         }
@@ -842,7 +849,7 @@ if active_section == SECTION_LAB:
             with col:
                 st.markdown(f"**{result['label']}**")
                 st.caption(
-                    f"Tokens visibles: {result['n_tokens']} | TTR: {result['ttr']} | "
+                    f"Tokens API: {result['n_tokens']} | TTR: {result['ttr']} | "
                     f"Latencia: {result['latency']}s"
                 )
                 with st.container(border=True):
@@ -855,7 +862,7 @@ if active_section == SECTION_LAB:
             y="n_tokens",
             color="label",
             title="Longitud en tokens por configuración",
-            labels={"label": "Configuración", "n_tokens": "Tokens visibles de salida"},
+            labels={"label": "Configuración", "n_tokens": "Tokens de salida (API)"},
             color_discrete_sequence=px.colors.qualitative.Plotly,
         )
         fig_tokens.update_layout(showlegend=False)
@@ -985,7 +992,7 @@ if active_section == SECTION_METRICS:
                         original_prompt=eval_prompt,
                         supports_top_k=supports_top_k,
                     )
-                    scores["LLM-Judge"] = round(judge_json["score"] / 10, 4)
+                    scores["LLM-Judge"] = judge_json["score"]
                     st.session_state["judge_json"] = judge_json
                     st.session_state["judge_usage"] = get_usage_stats(judge_response)
 
@@ -1008,7 +1015,7 @@ if active_section == SECTION_METRICS:
         m3.metric("ROUGE-L", scores.get("ROUGE-L", "N/A"))
         m4.metric("BERTScore F1", scores.get("BERTScore", "N/A"))
         judge_metric = scores.get("LLM-Judge")
-        m5.metric("LLM-Judge (/10)", round(judge_metric * 10, 1) if judge_metric is not None else "N/A")
+        m5.metric("LLM-Judge (/10)", judge_metric if judge_metric is not None else "N/A")
 
         if "judge_json" in st.session_state:
             judge_json = st.session_state["judge_json"]
