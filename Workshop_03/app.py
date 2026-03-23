@@ -73,6 +73,11 @@ SYSTEM_PROMPT = (
     "amablemente y rediriges la conversación hacia tu especialidad."
 )
 
+SECTION_LAB = "■ Laboratorio de Parámetros"
+SECTION_METRICS = "■ Métricas de Similitud"
+SECTION_AGENT = "■ Agente Especializado"
+SECTION_OPTIONS = [SECTION_LAB, SECTION_METRICS, SECTION_AGENT]
+
 
 def get_secret_value(key: str) -> str:
     """Lee una clave desde st.secrets sin fallar si no existe."""
@@ -124,18 +129,32 @@ def parse_json_payload(response: Any) -> dict:
     parsed = get_attr(response, "parsed", default=None)
     if isinstance(parsed, dict):
         return parsed
+    if parsed is not None and hasattr(parsed, "model_dump"):
+        return parsed.model_dump()
+    if isinstance(parsed, str):
+        return json.loads(parsed)
 
     raw_text = get_response_text(response)
     if not raw_text:
         raise ValueError("La respuesta JSON llegó vacía.")
+
+    raw_text = raw_text.strip()
+    raw_text = re.sub(r"^```(?:json)?\s*", "", raw_text, flags=re.IGNORECASE)
+    raw_text = re.sub(r"\s*```$", "", raw_text)
 
     try:
         return json.loads(raw_text)
     except json.JSONDecodeError:
         json_match = re.search(r"\{.*\}", raw_text, re.DOTALL)
         if json_match:
-            return json.loads(json_match.group())
-        raise
+            candidate = json_match.group()
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError:
+                candidate = re.sub(r"([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)", r'\1"\2"\3', candidate)
+                candidate = candidate.replace("'", '"')
+                return json.loads(candidate)
+        raise ValueError(f"No se pudo parsear el JSON del judge: {raw_text[:300]}")
 
 
 def build_generation_config(
@@ -148,6 +167,7 @@ def build_generation_config(
     supports_top_k: bool,
     system_instruction: str | None = None,
     response_json_schema: dict | None = None,
+    thinking_budget: int = 0,
 ):
     """Construye la configuración de generación para Gemini."""
     from google.genai import types
@@ -158,6 +178,7 @@ def build_generation_config(
         "max_output_tokens": max_output_tokens,
         "frequency_penalty": frequency_penalty,
         "presence_penalty": presence_penalty,
+        "thinking_config": types.ThinkingConfig(thinking_budget=thinking_budget),
     }
 
     if supports_top_k and top_k is not None:
@@ -314,8 +335,8 @@ def run_part3_judge(
     """Ejecuta LLM-as-Judge con salida JSON estructurada para la pestaña de métricas."""
     client = get_client(api_key)
     system_instruction = (
-        "Eres un evaluador experto en NLP. Compara la respuesta generada contra la referencia. "
-        "Responde estrictamente en JSON siguiendo el esquema solicitado."
+        "Eres un evaluador experto en NLP. Compara la respuesta generada contra la referencia "
+        "y devuelve un JSON válido con la evaluación."
     )
     judge_prompt = (
         f"REFERENCIA:\n{reference_text}\n\n"
@@ -323,23 +344,36 @@ def run_part3_judge(
         f"PROMPT ORIGINAL:\n{original_prompt}\n\n"
         "Evalúa veracidad, coherencia, relevancia y asigna un score general de 1 a 10."
     )
-    config = build_generation_config(
-        temperature=0.0,
-        top_p=0.1,
-        top_k=40,
-        max_output_tokens=512,
-        frequency_penalty=0.0,
-        presence_penalty=0.0,
-        supports_top_k=supports_top_k,
-        system_instruction=system_instruction,
-        response_json_schema=PART3_JUDGE_SCHEMA,
-    )
-    response = client.models.generate_content(
-        model=model_name,
-        contents=judge_prompt,
-        config=config,
-    )
-    judge_data = parse_json_payload(response)
+    last_error = None
+    for attempt in range(2):
+        try:
+            config = build_generation_config(
+                temperature=0.0,
+                top_p=0.1,
+                top_k=40,
+                max_output_tokens=512,
+                frequency_penalty=0.0,
+                presence_penalty=0.0,
+                supports_top_k=supports_top_k,
+                system_instruction=system_instruction,
+                response_json_schema=PART3_JUDGE_SCHEMA,
+                thinking_budget=0,
+            )
+            attempt_prompt = judge_prompt
+            if attempt == 1:
+                attempt_prompt += "\n\nDevuelve solo JSON válido, sin markdown ni texto extra."
+            response = client.models.generate_content(
+                model=model_name,
+                contents=attempt_prompt,
+                config=config,
+            )
+            judge_data = parse_json_payload(response)
+            break
+        except Exception as exc:
+            last_error = exc
+    else:
+        raise last_error
+
     judge_data["score"] = clamp_score(judge_data.get("score", 1))
     judge_data["veracidad"] = clamp_score(judge_data.get("veracidad", judge_data["score"]))
     judge_data["coherencia"] = clamp_score(judge_data.get("coherencia", judge_data["score"]))
@@ -360,31 +394,43 @@ def run_part4_judge(
     client = get_client(api_key)
     system_instruction = (
         "Eres un evaluador de asistentes conversacionales especializados en ML. "
-        "Evalúa la última respuesta según veracidad, coherencia y relevancia. "
-        "Responde solo en JSON."
+        "Evalúa la última respuesta según veracidad, coherencia y relevancia y devuelve JSON válido."
     )
     judge_prompt = (
         f"PREGUNTA DEL USUARIO:\n{user_question}\n\n"
         f"RESPUESTA DEL AGENTE:\n{assistant_answer}\n\n"
         "Devuelve una puntuación general de 1 a 10 y los sub-scores."
     )
-    config = build_generation_config(
-        temperature=0.0,
-        top_p=0.1,
-        top_k=40,
-        max_output_tokens=256,
-        frequency_penalty=0.0,
-        presence_penalty=0.0,
-        supports_top_k=supports_top_k,
-        system_instruction=system_instruction,
-        response_json_schema=PART4_JUDGE_SCHEMA,
-    )
-    response = client.models.generate_content(
-        model=model_name,
-        contents=judge_prompt,
-        config=config,
-    )
-    judge_data = parse_json_payload(response)
+    last_error = None
+    for attempt in range(2):
+        try:
+            config = build_generation_config(
+                temperature=0.0,
+                top_p=0.1,
+                top_k=40,
+                max_output_tokens=256,
+                frequency_penalty=0.0,
+                presence_penalty=0.0,
+                supports_top_k=supports_top_k,
+                system_instruction=system_instruction,
+                response_json_schema=PART4_JUDGE_SCHEMA,
+                thinking_budget=0,
+            )
+            attempt_prompt = judge_prompt
+            if attempt == 1:
+                attempt_prompt += "\n\nDevuelve solo JSON válido, sin markdown ni comentarios."
+            response = client.models.generate_content(
+                model=model_name,
+                contents=attempt_prompt,
+                config=config,
+            )
+            judge_data = parse_json_payload(response)
+            break
+        except Exception as exc:
+            last_error = exc
+    else:
+        raise last_error
+
     for key in ("score", "veracidad", "coherencia", "relevancia"):
         judge_data[key] = clamp_score(judge_data.get(key, 1))
     return judge_data, response
@@ -429,6 +475,14 @@ def line_chart(df: pd.DataFrame, y_col: str, title: str, color: str) -> go.Figur
     return fig
 
 
+if "active_section" not in st.session_state:
+    st.session_state["active_section"] = SECTION_LAB
+if "agent_temp" not in st.session_state:
+    st.session_state["agent_temp"] = 0.5
+if "agent_max_tok" not in st.session_state:
+    st.session_state["agent_max_tok"] = 600
+
+active_section = st.session_state["active_section"]
 api_key = get_secret_value("GEMINI_API_KEY")
 
 with st.sidebar:
@@ -455,31 +509,68 @@ with st.sidebar:
         st.caption(model_capabilities["note"])
 
     st.caption("Costos estimados según pricing público del Gemini Developer API.")
+    max_agent_limit = min(2048, max_model_output)
+    st.session_state["agent_max_tok"] = min(int(st.session_state["agent_max_tok"]), max_agent_limit)
+    agent_temp = float(st.session_state["agent_temp"])
+    agent_max_tok = int(st.session_state["agent_max_tok"])
+
     st.divider()
-    st.subheader("🎛️ Agente")
-    agent_temp = st.slider("Temperatura agente", 0.0, 2.0, 0.5, 0.05, key="agent_temp")
-    agent_max_tok = st.slider(
-        "Max tokens agente",
-        50,
-        min(2048, max_model_output),
-        min(600, max_model_output),
-        50,
-        key="agent_max_tok",
-    )
+    if active_section == SECTION_AGENT:
+        st.subheader("🎛️ Agente")
+        st.caption("Controles visibles porque estás en la sección del agente conversacional.")
+        agent_temp = st.slider("Temperatura agente", 0.0, 2.0, agent_temp, 0.05, key="agent_temp")
+        agent_max_tok = st.slider(
+            "Max tokens agente",
+            50,
+            max_agent_limit,
+            min(agent_max_tok, max_agent_limit),
+            50,
+            key="agent_max_tok",
+        )
+    else:
+        st.subheader("🎛️ Agente")
+        st.caption("Abre la sección del agente para ver y ajustar sus controles en esta barra lateral.")
 
-
-tab2, tab3, tab4 = st.tabs(
-    [
-        "■ Laboratorio de Parámetros",
-        "■ Métricas de Similitud",
-        "■ Agente Especializado",
-    ]
+st.markdown(
+    """
+    <style>
+    div[role="radiogroup"] {
+        gap: 0.5rem;
+    }
+    div[role="radiogroup"] label {
+        border: 1px solid #d7deea;
+        border-radius: 0.9rem;
+        padding: 0.45rem 0.9rem;
+        background: #f7f9fc;
+    }
+    div[role="radiogroup"] label:has(input:checked) {
+        border-color: #4f83ff;
+        background: #e8f0ff;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
+st.markdown("### Secciones del Laboratorio")
+active_section = st.radio(
+    "Secciones",
+    options=SECTION_OPTIONS,
+    key="active_section",
+    horizontal=True,
+    label_visibility="collapsed",
+)
+st.divider()
 
-with tab2:
+
+if active_section == SECTION_LAB:
     st.title("Laboratorio de Sintonización de Parámetros")
     st.caption("Experimenta con los hiperparámetros de generación y observa su efecto.")
+    st.caption(
+        "Los controles de esta pestaña afectan la prueba individual. "
+        "En el experimento comparativo obligatorio, temperatura y top-p se reemplazan "
+        "por las 4 configuraciones exigidas por la rúbrica."
+    )
 
     with st.expander("⚙️ Panel de Control Interactivo", expanded=True):
         c1, c2, c3 = st.columns(3)
@@ -521,6 +612,10 @@ with tab2:
                 0.1,
                 help="Penalización por aparición previa de tokens",
             )
+        st.caption(
+            "Nota: top-k y top-p pueden usarse juntos, pero para entender mejor su efecto "
+            "conviene variar uno a la vez."
+        )
 
     if not supports_top_k:
         st.info("Top-k no está disponible en este modelo según su metadata; los demás parámetros sí se aplican.")
@@ -577,6 +672,13 @@ with tab2:
             st.error("Ingresa tu API Key de Gemini en la barra lateral.")
         else:
             results = []
+            experiment_context = {
+                "model_name": model_name,
+                "top_k": int(top_k),
+                "max_tok": int(max_tok),
+                "freq_pen": float(freq_pen),
+                "pres_pen": float(pres_pen),
+            }
             progress = st.progress(0, text="Generando respuestas…")
             for index, config in enumerate(configs):
                 try:
@@ -594,12 +696,12 @@ with tab2:
                         supports_top_k=supports_top_k,
                     )
                     latency = round(time.time() - start_time, 2)
-                    usage = get_usage_stats(response)
+                    visible_tokens = len(tokenize_text(text))
                     results.append(
                         {
                             "label": config["label"],
                             "text": text,
-                            "n_tokens": usage["completion_tokens"],
+                            "n_tokens": visible_tokens,
                             "ttr": compute_ttr(text),
                             "latency": latency,
                         }
@@ -617,23 +719,32 @@ with tab2:
                 progress.progress((index + 1) / len(configs), text=f"Configuración {index + 1}/4…")
             progress.empty()
             st.session_state["compare_results"] = results
+            st.session_state["compare_context"] = experiment_context
 
     if "compare_results" in st.session_state:
         results = st.session_state["compare_results"]
+        current_context = {
+            "model_name": model_name,
+            "top_k": int(top_k),
+            "max_tok": int(max_tok),
+            "freq_pen": float(freq_pen),
+            "pres_pen": float(pres_pen),
+        }
+        if st.session_state.get("compare_context") != current_context:
+            st.warning(
+                "Estos resultados fueron generados con otra configuración secundaria. "
+                "Si cambiaste top-k, max tokens o penalties, vuelve a ejecutar el experimento."
+            )
         cols = st.columns(4)
         for col, result in zip(cols, results):
             with col:
                 st.markdown(f"**{result['label']}**")
                 st.caption(
-                    f"Tokens: {result['n_tokens']} | TTR: {result['ttr']} | "
+                    f"Tokens visibles: {result['n_tokens']} | TTR: {result['ttr']} | "
                     f"Latencia: {result['latency']}s"
                 )
-                st.text_area(
-                    label=f"Salida {result['label']}",
-                    value=result["text"],
-                    height=260,
-                    key=f"res_{result['label']}",
-                )
+                with st.container(border=True):
+                    st.write(result["text"])
 
         df_compare = pd.DataFrame(results)
         fig_tokens = px.bar(
@@ -642,7 +753,7 @@ with tab2:
             y="n_tokens",
             color="label",
             title="Longitud en tokens por configuración",
-            labels={"label": "Configuración", "n_tokens": "Tokens de salida"},
+            labels={"label": "Configuración", "n_tokens": "Tokens visibles de salida"},
             color_discrete_sequence=px.colors.qualitative.Plotly,
         )
         fig_tokens.update_layout(showlegend=False)
@@ -671,7 +782,7 @@ with tab2:
         )
 
 
-with tab3:
+if active_section == SECTION_METRICS:
     st.title("Métricas de Similitud y Evaluación Automática")
     st.caption("Compara cuantitativamente un texto de referencia con la salida del LLM.")
 
@@ -711,7 +822,7 @@ with tab3:
                         temperature=0.3,
                         top_p=0.9,
                         top_k=40,
-                        max_output_tokens=min(512, max_model_output),
+                        max_output_tokens=min(768, max_model_output),
                         frequency_penalty=0.0,
                         presence_penalty=0.0,
                         supports_top_k=supports_top_k,
@@ -818,7 +929,7 @@ with tab3:
             st.plotly_chart(fig_radar, use_container_width=True)
 
 
-with tab4:
+if active_section == SECTION_AGENT:
     st.title("Agente Especializado – Tutor de Machine Learning")
     st.caption("Chat con memoria conversacional y métricas de producción en tiempo real.")
 
@@ -842,112 +953,98 @@ with tab4:
         if not api_key:
             st.error("Ingresa tu API Key de Gemini en la barra lateral.")
         else:
-            with st.chat_message("user"):
-                st.write(user_input)
-
-            with st.chat_message("assistant"):
+            try:
                 with st.spinner("MLBot está pensando…"):
-                    try:
-                        client = get_client(api_key)
-                        chat_config = build_generation_config(
-                            temperature=agent_temp,
-                            top_p=0.9,
-                            top_k=40,
-                            max_output_tokens=agent_max_tok,
-                            frequency_penalty=0.0,
-                            presence_penalty=0.0,
-                            supports_top_k=supports_top_k,
-                            system_instruction=SYSTEM_PROMPT,
-                        )
-                        chat = client.chats.create(
-                            model=model_name,
-                            history=history_to_gemini_contents(st.session_state["agent_history"]),
-                            config=chat_config,
-                        )
+                    client = get_client(api_key)
+                    chat_config = build_generation_config(
+                        temperature=agent_temp,
+                        top_p=0.9,
+                        top_k=40,
+                        max_output_tokens=agent_max_tok,
+                        frequency_penalty=0.0,
+                        presence_penalty=0.0,
+                        supports_top_k=supports_top_k,
+                        system_instruction=SYSTEM_PROMPT,
+                    )
+                    chat = client.chats.create(
+                        model=model_name,
+                        history=history_to_gemini_contents(st.session_state["agent_history"]),
+                        config=chat_config,
+                    )
 
-                        start_time = time.time()
-                        response = chat.send_message(user_input)
-                        latency = time.time() - start_time
-                        response_text = get_response_text(response)
-                        st.write(response_text)
+                    start_time = time.time()
+                    response = chat.send_message(user_input)
+                    latency = time.time() - start_time
+                    response_text = get_response_text(response)
 
-                        main_usage = get_usage_stats(response)
-                        main_cost = estimate_cost(model_name, main_usage)
-                        tps = main_usage["completion_tokens"] / latency if latency > 0 else 0.0
+                    main_usage = get_usage_stats(response)
+                    main_cost = estimate_cost(model_name, main_usage)
+                    tps = main_usage["completion_tokens"] / latency if latency > 0 else 0.0
 
-                        judge_score = None
-                        judge_cost_total = 0.0
-                        judge_details = None
-                        try:
-                            judge_details, judge_response = run_part4_judge(
-                                api_key=api_key,
-                                model_name=model_name,
-                                user_question=user_input,
-                                assistant_answer=response_text,
-                                supports_top_k=supports_top_k,
-                            )
-                            judge_score = judge_details["score"]
-                            judge_usage = get_usage_stats(judge_response)
-                            judge_cost_total = estimate_cost(model_name, judge_usage)["total_cost"]
-                        except Exception:
-                            judge_details = None
+                    judge_details, judge_response = run_part4_judge(
+                        api_key=api_key,
+                        model_name=model_name,
+                        user_question=user_input,
+                        assistant_answer=response_text,
+                        supports_top_k=supports_top_k,
+                    )
+                    judge_score = judge_details["score"]
+                    judge_usage = get_usage_stats(judge_response)
+                    judge_cost_total = estimate_cost(model_name, judge_usage)["total_cost"]
+                    total_turn_cost = main_cost["total_cost"] + judge_cost_total
 
-                        total_turn_cost = main_cost["total_cost"] + judge_cost_total
+                st.session_state["agent_history"].append({"role": "user", "content": user_input})
+                st.session_state["agent_history"].append({"role": "assistant", "content": response_text})
 
-                        st.session_state["agent_history"].append({"role": "user", "content": user_input})
-                        st.session_state["agent_history"].append(
-                            {"role": "assistant", "content": response_text}
-                        )
-
-                        turn_number = len(st.session_state["agent_metrics"]) + 1
-                        st.session_state["agent_metrics"].append(
-                            {
-                                "Turno": turn_number,
-                                "Latencia (s)": round(latency, 2),
-                                "TPS": round(tps, 2),
-                                "Tokens entrada": main_usage["prompt_tokens"],
-                                "Tokens salida": main_usage["completion_tokens"],
-                                "Thinking tokens": main_usage["thought_tokens"],
-                                "Costo respuesta USD": round(main_cost["total_cost"], 6),
-                                "Costo judge USD": round(judge_cost_total, 6),
-                                "Costo total USD": round(total_turn_cost, 6),
-                                "LLM-Judge": judge_score,
-                            }
-                        )
-
-                        with st.expander("📊 Métricas de este turno", expanded=True):
-                            row1_col1, row1_col2, row1_col3 = st.columns(3)
-                            row1_col1.metric("Latencia", f"{latency:.2f}s")
-                            row1_col2.metric("TPS", f"{tps:.2f}")
-                            row1_col3.metric("LLM-Judge", f"{judge_score}/10" if judge_score else "N/A")
-
-                            row2_col1, row2_col2, row2_col3 = st.columns(3)
-                            row2_col1.metric("Tokens entrada", main_usage["prompt_tokens"])
-                            row2_col2.metric("Tokens salida", main_usage["completion_tokens"])
-                            row2_col3.metric("Costo total USD", f"${total_turn_cost:.6f}")
-
-                            st.caption(
-                                "Costo respuesta: "
-                                f"${main_cost['total_cost']:.6f} | "
-                                f"Costo judge: ${judge_cost_total:.6f} | "
-                                f"Thinking tokens: {main_usage['thought_tokens']}"
-                            )
-                            if judge_details:
-                                st.caption(
-                                    "Judge detalle — "
-                                    f"Veracidad: {judge_details['veracidad']} | "
-                                    f"Coherencia: {judge_details['coherencia']} | "
-                                    f"Relevancia: {judge_details['relevancia']}"
-                                )
-
-                    except Exception as exc:
-                        st.error(f"Error en el agente: {exc}")
+                turn_number = len(st.session_state["agent_metrics"]) + 1
+                st.session_state["agent_metrics"].append(
+                    {
+                        "Turno": turn_number,
+                        "Latencia (s)": round(latency, 2),
+                        "TPS": round(tps, 2),
+                        "Tokens entrada": main_usage["prompt_tokens"],
+                        "Tokens salida": main_usage["completion_tokens"],
+                        "Thinking tokens": main_usage["thought_tokens"],
+                        "Costo respuesta USD": round(main_cost["total_cost"], 6),
+                        "Costo judge USD": round(judge_cost_total, 6),
+                        "Costo total USD": round(total_turn_cost, 6),
+                        "LLM-Judge": judge_score,
+                        "Judge veracidad": judge_details["veracidad"],
+                        "Judge coherencia": judge_details["coherencia"],
+                        "Judge relevancia": judge_details["relevancia"],
+                    }
+                )
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Error en el agente: {exc}")
 
     if st.session_state["agent_metrics"]:
         st.divider()
         st.subheader("Historial de Métricas por Turno")
         df_metrics = pd.DataFrame(st.session_state["agent_metrics"])
         df_metrics["Costo acumulado USD"] = df_metrics["Costo total USD"].cumsum()
+
+        latest_turn = df_metrics.iloc[-1]
+        with st.expander("📊 Métricas del último turno", expanded=True):
+            row1_col1, row1_col2, row1_col3 = st.columns(3)
+            row1_col1.metric("Latencia", f"{latest_turn['Latencia (s)']:.2f}s")
+            row1_col2.metric("TPS", f"{latest_turn['TPS']:.2f}")
+            row1_col3.metric(
+                "LLM-Judge",
+                f"{int(latest_turn['LLM-Judge'])}/10" if pd.notna(latest_turn["LLM-Judge"]) else "N/A",
+            )
+
+            row2_col1, row2_col2, row2_col3 = st.columns(3)
+            row2_col1.metric("Tokens entrada", int(latest_turn["Tokens entrada"]))
+            row2_col2.metric("Tokens salida", int(latest_turn["Tokens salida"]))
+            row2_col3.metric("Costo total USD", f"${latest_turn['Costo total USD']:.6f}")
+
+            st.caption(
+                "Judge detalle — "
+                f"Veracidad: {int(latest_turn['Judge veracidad'])} | "
+                f"Coherencia: {int(latest_turn['Judge coherencia'])} | "
+                f"Relevancia: {int(latest_turn['Judge relevancia'])}"
+            )
 
         tab_lat, tab_tps, tab_judge, tab_cost = st.tabs(["Latencia", "TPS", "LLM-Judge", "Costo"])
 
